@@ -19,6 +19,11 @@ x-zbx-clickhouse-schema-env: &zbx-clickhouse-schema-env
   ZBX_TELEMETRYPROVIDER_0_SCHEMA: '{"create":true}'
 
 # OpenTelemetry dos serviços de demo -> coletor APM do Zabbix proxy (OTLP gRPC)
+# Limite de recursos dos containers de demo (nada aqui consegue travar a máquina)
+x-limite-demo: &limite-demo
+  cpus: "0.5"
+  mem_limit: 256m
+
 x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: http://zabbix-proxy:4317
   OTEL_EXPORTER_OTLP_PROTOCOL: grpc
@@ -133,6 +138,7 @@ services:
     image: zabbix/zabbix-agent2:8.0-ubuntu-latest
     hostname: linux-demo
     restart: unless-stopped
+    <<: *limite-demo
     environment:
       ZBX_HOSTNAME: linux-demo
       ZBX_SERVER_HOST: zabbix-server
@@ -154,6 +160,7 @@ services:
   pedidos:
     build: ./services/pedidos
     restart: unless-stopped
+    <<: *limite-demo
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: pedidos
@@ -170,6 +177,7 @@ services:
   estoque:
     build: ./services/estoque
     restart: unless-stopped
+    <<: *limite-demo
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: estoque
@@ -184,6 +192,7 @@ services:
   notificacoes:
     image: python:3.12-alpine
     restart: unless-stopped
+    <<: *limite-demo
     command: ["python", "-u", "/app/app.py"]
     volumes:
       - ./services/notificacoes:/app:ro
@@ -194,6 +203,7 @@ services:
   loadgen:
     image: busybox:1.37
     restart: unless-stopped
+    <<: *limite-demo
     command: ["sh", "-c", "while true; do wget -q -O /dev/null http://pedidos:8001/pedidos/novo 2>/dev/null; sleep 1; done"]
     depends_on:
       - pedidos
