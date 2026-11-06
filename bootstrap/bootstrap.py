@@ -154,9 +154,11 @@ def ensure_otel_service_template():
                           "Telemetry query por ServiceName = {$OTLP.SERVICE.NAME}.\n\n" + tpl["description"])
     export["zabbix_export"]["triggers"] = export["zabbix_export"].get("triggers", []) + [{
         "uuid": "0",
-        # 2 coletas seguidas sem nenhum span, num serviço que mandou spans nos últimos 30 min
-        # (sem a 2ª parte, o host recém-criado dispara antes da primeira telemetria chegar)
-        "expression": "(" + "+".join(f"max(/{OTEL_SRC_TEMPLATE}/otlp.span.status.{s},#2)" for s in ("ok", "error", "unset"))
+        # Última coleta sem nenhum span, num serviço que mandou spans nos últimos 30 min (sem a 2ª parte,
+        # o host recém-criado dispara antes da primeira telemetria chegar). Usa last() porque os itens de
+        # contagem têm "Discard unchanged with heartbeat 1h": zeros repetidos não são gravados, então
+        # funções como max(...,#2) nunca chegariam a 0.
+        "expression": "(" + "+".join(f"last(/{OTEL_SRC_TEMPLATE}/otlp.span.status.{s})" for s in ("ok", "error", "unset"))
                       + ")=0 and (" + "+".join(f"max(/{OTEL_SRC_TEMPLATE}/otlp.span.status.{s},30m)" for s in ("ok", "error", "unset"))
                       + ")>0",
         "name": "OpenTelemetry: serviço sem telemetria",
