@@ -274,9 +274,9 @@ def ensure_action(mediatypeid, userid, groupids):
 # Constantes de CCepRuleHelper / defines.inc.php do frontend 8.0
 WIN_NONE, WIN_CAUSE_SYMPTOM, WIN_PATTERN = 0, 2, 4
 WHEN_OCCURRED, WHEN_ADDED, WHEN_PATTERN = 0, 1, 4
-OP_SET_NAME, OP_INCREASE_SEVERITY, OP_CLONE_FIRST, OP_ADD_TAG, OP_CLOSE_WINDOW = 1, 5, 9, 11, 18
+OP_SET_NAME, OP_INCREASE_SEVERITY, OP_ADD_TAG, OP_CLOSE_WINDOW = 1, 5, 11, 18
 COND_TAG_VALUE, COND_HOST_GROUP = 26, 37
-OPCOND_SYMPTOM, OPCOND_COPIED = 33, 34
+OPCOND_FIRST, OPCOND_SYMPTOM = 31, 33
 OPER_EQUAL, OPER_YES, OPER_NO = 0, 10, 11
 SCOPE_CURRENT, SCOPE_ALL = 0, 2
 
@@ -287,6 +287,7 @@ def cond_filter(*conditions):
 
 
 APM_GROUP_FILTER = cond_filter({"type": COND_HOST_GROUP, "operator": OPER_EQUAL, "host_group_name": APM_GROUP})
+FIRST_EVENT = cond_filter({"type": OPCOND_FIRST, "operator": OPER_YES})  # primeiro evento da janela
 
 PATTERN_SCRIPT = """// Dispara quando 3 ou mais problemas dos serviços APM acontecem dentro da janela
 return cep_get_events().length >= 3;"""
@@ -309,6 +310,22 @@ CEP_RULES = [
             {"execute_when": WHEN_OCCURRED, "type": OP_ADD_TAG, "tag": "impacto", "tag_value": "cliente", "scope": SCOPE_CURRENT},
         ],
     },
+    # Precisa vir ANTES da regra de causa/sintoma: depois que um evento é marcado como sintoma,
+    # as regras seguintes não o recebem mais (a janela do pattern match nunca chegaria a 3 eventos).
+    {
+        "name": "Lab: incidente com vários alertas (pattern match)",
+        "description": "Quando 3 ou mais problemas dos serviços APM acontecem em 5 min, o primeiro deles é renomeado "
+                       "para 'Incidente: degradação nos serviços APM' e sobe um nível de severidade; a janela reinicia.",
+        "window_type": WIN_PATTERN, "filter": APM_GROUP_FILTER, "window": {"duration": "5m", "script": PATTERN_SCRIPT},
+        # Não usa "clone": os triggers são de problema único, então clonar um evento ainda aberto é descartado
+        # em silêncio. Renomear/escalar o primeiro evento da janela funciona.
+        "operations": [
+            {"execute_when": WHEN_PATTERN, "type": OP_SET_NAME, "scope": SCOPE_ALL, "scope_filter": FIRST_EVENT,
+             "event_name": "Incidente: degradação nos serviços APM (3+ alertas em 5 min)"},
+            {"execute_when": WHEN_PATTERN, "type": OP_INCREASE_SEVERITY, "scope": SCOPE_ALL, "scope_filter": FIRST_EVENT},
+            {"execute_when": WHEN_PATTERN, "type": OP_CLOSE_WINDOW, "scope": SCOPE_ALL},
+        ],
+    },
     {
         "name": "Lab: falha em cascata (causa e sintomas)",
         "description": "Agrupa os problemas dos serviços APM numa janela de 10 min: o primeiro vira a causa e os "
@@ -319,19 +336,6 @@ CEP_RULES = [
              "filter": cond_filter({"type": OPCOND_SYMPTOM, "operator": OPER_YES})},
             {"execute_when": WHEN_ADDED, "type": OP_ADD_TAG, "tag": "cep", "tag_value": "causa", "scope": SCOPE_CURRENT,
              "filter": cond_filter({"type": OPCOND_SYMPTOM, "operator": OPER_NO})},
-        ],
-    },
-    {
-        "name": "Lab: incidente com vários alertas (pattern match)",
-        "description": "Quando 3 ou mais problemas dos serviços APM acontecem em 5 min, cria um evento "
-                       "'Incidente: degradação nos serviços APM' (cópia do primeiro evento da janela, que fica "
-                       "aberta enquanto o problema original durar) e reinicia a janela.",
-        "window_type": WIN_PATTERN, "filter": APM_GROUP_FILTER, "window": {"duration": "5m", "script": PATTERN_SCRIPT},
-        "operations": [
-            {"execute_when": WHEN_OCCURRED, "type": OP_SET_NAME, "event_name": "Incidente: degradação nos serviços APM",
-             "scope": SCOPE_CURRENT, "filter": cond_filter({"type": OPCOND_COPIED, "operator": OPER_YES})},
-            {"execute_when": WHEN_PATTERN, "type": OP_CLONE_FIRST, "scope": SCOPE_ALL},
-            {"execute_when": WHEN_PATTERN, "type": OP_CLOSE_WINDOW, "scope": SCOPE_ALL},
         ],
     },
 ]
