@@ -1,0 +1,203 @@
+# Zabbix 8.0 LTS + ClickHouse - ambiente de review (não usar em produção)
+# Postgres guarda configuração; ClickHouse guarda histórico (todos os tipos) e telemetria (APM/OTel).
+name: zabbix8
+
+x-zbx-db-env: &zbx-db-env
+  DB_SERVER_HOST: postgres
+  POSTGRES_USER: zabbix
+  POSTGRES_PASSWORD: zabbix
+  POSTGRES_DB: zabbix
+
+# Providers ClickHouse (server e frontend): um objeto JSON por provider (_0, _1...)
+x-zbx-clickhouse-env: &zbx-clickhouse-env
+  ZBX_HISTORYPROVIDER_0: '{"provider":"clickhouse","types":["uint","dbl","str","log","text","json"],"url":"http://clickhouse:8123","db":"zabbix","username":"zabbix","password":"zabbix"}'
+  ZBX_TELEMETRYPROVIDER_0: '{"provider":"clickhouse","url":"http://clickhouse:8123","db":"zabbix","username":"zabbix","password":"zabbix"}'
+
+# Só no server: cria as tabelas no ClickHouse na subida (padrões: TTL 31 dias, partição diária, MergeTree)
+x-zbx-clickhouse-schema-env: &zbx-clickhouse-schema-env
+  ZBX_HISTORYPROVIDER_0_SCHEMA: '{"create":true}'
+  ZBX_TELEMETRYPROVIDER_0_SCHEMA: '{"create":true}'
+
+# OpenTelemetry dos serviços de demo -> coletor APM do Zabbix proxy (OTLP gRPC)
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://zabbix-proxy:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=lab
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: zabbix
+      POSTGRES_DB: zabbix
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix -d zabbix"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    # Server exige >= 26.3, mas o APM do proxy só funciona a partir do 26.8: no 26.3 o ClickHouse
+    # rejeita os timestamps (unix com fração) enviados pelo proxy e descarta os dados em silêncio.
+    image: clickhouse/clickhouse-server:26.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: zabbix
+      CLICKHOUSE_USER: zabbix
+      CLICKHOUSE_PASSWORD: zabbix
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"   # HTTP (consultas / Play UI em http://localhost:8123/play)
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:8.0-alpine-latest
+    restart: unless-stopped
+    environment:
+      <<: [*zbx-db-env, *zbx-clickhouse-env, *zbx-clickhouse-schema-env]
+    ports:
+      - "10051:10051"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:8.0-alpine-latest
+    restart: unless-stopped
+    environment:
+      <<: [*zbx-db-env, *zbx-clickhouse-env]
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_PORT: "10051"
+      PHP_TZ: America/Sao_Paulo
+    ports:
+      - "8080:8080"
+    depends_on:
+      - zabbix-server
+
+  # Agente do próprio host "Zabbix server"
+  zabbix-agent:
+    image: zabbix/zabbix-agent2:8.0-alpine-latest
+    restart: unless-stopped
+    environment:
+      ZBX_HOSTNAME: "Zabbix server"
+      ZBX_SERVER_HOST: zabbix-server
+    depends_on:
+      - zabbix-server
+
+  # Proxy ativo com o coletor APM: recebe OTLP gRPC (traces, metrics, logs) e grava no ClickHouse
+  zabbix-proxy:
+    image: zabbix/zabbix-proxy-sqlite3:8.0-alpine-latest
+    restart: unless-stopped
+    environment:
+      ZBX_PROXYMODE: "0"                 # ativo
+      ZBX_HOSTNAME: zabbix-proxy         # precisa bater com o proxy cadastrado no server (bootstrap)
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_PROXYCONFIGFREQUENCY: "10"
+      ZBX_STARTAPMCOLLECTOR: "1"         # escuta OTLP gRPC em :4317
+      ZBX_TELEMETRYPROVIDER_0: '{"provider":"clickhouse","url":"http://clickhouse:8123","db":"zabbix","username":"zabbix","password":"zabbix"}'
+    ports:
+      - "4317:4317"   # OTLP gRPC: aponte suas próprias apps para localhost:4317
+    # A porta 4317 só abre depois que o bootstrap habilita "APM data collection" no proxy
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tln | grep -q ':4317 '"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    depends_on:
+      zabbix-server:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+
+  # "Servidor Linux" monitorado: Ubuntu com Zabbix agent 2 (template Linux by Zabbix agent)
+  linux-demo:
+    image: zabbix/zabbix-agent2:8.0-ubuntu-latest
+    hostname: linux-demo
+    restart: unless-stopped
+    environment:
+      ZBX_HOSTNAME: linux-demo
+      ZBX_SERVER_HOST: zabbix-server
+    depends_on:
+      - zabbix-server
+
+  # Configura proxy, host linux-demo etc. pela API e encerra
+  bootstrap:
+    image: python:3.12-alpine
+    restart: on-failure
+    command: ["python", "-u", "/bootstrap/bootstrap.py"]
+    volumes:
+      - ./bootstrap:/bootstrap:ro
+    depends_on:
+      zabbix-web:
+        condition: service_healthy
+
+  # ---------- Serviços de demo instrumentados com OpenTelemetry ----------
+  pedidos:
+    build: ./services/pedidos
+    restart: unless-stopped
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: pedidos
+      OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+      ESTOQUE_URL: http://estoque:8002
+    ports:
+      - "8001:8001"
+    depends_on:
+      estoque:
+        condition: service_started
+      zabbix-proxy:
+        condition: service_healthy
+
+  estoque:
+    build: ./services/estoque
+    restart: unless-stopped
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: estoque
+      OTEL_NODE_RESOURCE_DETECTORS: env,host,os,process   # sem detectores de nuvem (GCP/AWS/Azure)
+    ports:
+      - "8002:8002"
+    depends_on:
+      zabbix-proxy:
+        condition: service_healthy
+
+  # Recebe os alertas do Zabbix (media type "Lab webhook") e mostra numa página
+  notificacoes:
+    image: python:3.12-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/app.py"]
+    volumes:
+      - ./services/notificacoes:/app:ro
+    ports:
+      - "8090:8090"
+
+  # Gera tráfego contínuo: ~1 pedido por segundo
+  loadgen:
+    image: busybox:1.37
+    restart: unless-stopped
+    command: ["sh", "-c", "while true; do wget -q -O /dev/null http://pedidos:8001/pedidos/novo 2>/dev/null; sleep 1; done"]
+    depends_on:
+      - pedidos
+
+volumes:
+  pgdata:
+  chdata:
