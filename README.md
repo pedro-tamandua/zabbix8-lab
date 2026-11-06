@@ -88,16 +88,14 @@ Acompanhe em **Monitoring → Problems**, **APM → Traces** e na página de not
 
 | Cenário | O que deve aparecer | Tempo aproximado |
 |---|---|---|
-| `caos erro` | Logs ERROR e taxa de erro de spans acima de 5% no `estoque` (causa) e no `pedidos` (sintomas) | 1–3 min |
+| `caos erro` | Logs ERROR e taxa de erro de spans acima de 5% no `estoque` (causa) e no `pedidos` (sintomas). No 3º alerta, a causa vira **Incidente: degradação nos serviços APM** e sobe de severidade | 1–3 min |
 | `caos lento` | Duração de span alta nos dois serviços | 3–5 min |
-| `estoque-fora` | **estoque parou de enviar spans** (High) + erros 503 no `pedidos` | 1–3 min |
+| `estoque-fora` | **estoque parou de enviar spans** (High) + erros 503 no `pedidos`. Aqui o `pedidos` costuma virar a causa: os erros dele aparecem antes de o Zabbix notar a falta de telemetria do `estoque` | 1–3 min |
 | `linux-fora` | *Linux: Zabbix agent is not available* no `linux-demo` | ~3 min |
 
 Nenhum cenário consome CPU: as falhas são simuladas no código ou com o container parado. Não há cenário de CPU alta porque os containers enxergam a CPU da VM inteira do Docker: para disparar o alerta seria preciso ocupar todos os núcleos da máquina. Os containers de demo também têm limite de 0,5 CPU e 256 MB cada.
 
 > A janela de causa/sintoma é de 10 min. Se você rodar um cenário logo depois do outro, os problemas do segundo viram sintomas da causa do primeiro. Para ver cada cenário isolado, espere uns 10 min entre eles.
->
-> **Em investigação:** a regra de *pattern match* (incidente com 3 ou mais alertas) criou o evento **Incidente: degradação nos serviços APM** numa rodada de teste, mas não nas seguintes.
 
 ## Alertas
 
@@ -109,7 +107,7 @@ Nenhum cenário consome CPU: as falhas são simuladas no código ou com o contai
 O Zabbix 8.0 traz o template **Generic OpenTelemetry by OTLP**, que usa o novo tipo de item **Telemetry query** (consulta o ClickHouse direto, executado pelo proxy). Só que ele **não filtra por serviço**: cada item soma a telemetria de todas as aplicações. Por isso o bootstrap deriva dele o template *OpenTelemetry service by OTLP*, que:
 - adiciona o filtro `ServiceName = {$OTLP.SERVICE.NAME}` em todos os itens *Telemetry query*;
 - reduz as janelas de duração de 5 para 2 min (para o lab reagir mais rápido);
-- inclui o trigger **"serviço sem telemetria"**: 2 coletas sem spans, num serviço que mandou spans nos últimos 30 min.
+- inclui o trigger **"serviço sem telemetria"**: última coleta sem spans, num serviço que mandou spans nos últimos 30 min.
 
 Cada host de APM é monitorado pelo proxy e tem a macro `{$OTLP.SERVICE.NAME}` com o `service.name` do OpenTelemetry. O `estoque` coleta a cada 30 s e o `pedidos` a cada 2 min (veja o porquê em CEP, abaixo).
 
@@ -117,17 +115,20 @@ Cada host de APM é monitorado pelo proxy e tem a macro `{$OTLP.SERVICE.NAME}` c
 
 ## CEP — Event processing
 
-Fica em **Data collection → Event processing**. O Zabbix 8.0 já vem com 6 regras de exemplo, todas desligadas. O bootstrap cria 4 regras para o cenário do lab:
+Fica em **Data collection → Event processing**. O Zabbix 8.0 já vem com 6 regras de exemplo, todas desligadas. O bootstrap cria 4 regras para o cenário do lab, nesta ordem de execução:
 
 | Regra | Janela | O que faz |
 |---|---|---|
 | **Lab: enriquecer eventos dos serviços APM** | nenhuma | Adiciona a tag `time: plataforma` em todo evento do grupo *APM services* |
 | **Lab: pedidos é crítico para o negócio** | nenhuma | Eventos com a tag `servico: pedidos` sobem 1 nível de severidade e ganham `impacto: cliente` |
+| **Lab: incidente com vários alertas** | *pattern match*, 5 min | Script JS: com 3 ou mais problemas na janela, o primeiro é renomeado para **"Incidente: degradação nos serviços APM (3+ alertas em 5 min)"**, sobe 1 nível de severidade e a janela reinicia |
 | **Lab: falha em cascata (causa e sintomas)** | causa/sintoma, 10 min | O primeiro problema da janela vira a **causa** e os seguintes viram **sintomas** dele (tags `cep: causa` / `cep: sintoma`) |
-| **Lab: incidente com vários alertas** | *pattern match*, 5 min | Script JS: com 3 ou mais problemas na janela, clona o primeiro como **"Incidente: degradação nos serviços APM"** e reinicia a janela |
 
 Comportamentos observados que valem para o review:
+- **A ordem das regras importa.** Depois que a regra de causa/sintoma marca um evento como sintoma, as regras seguintes não recebem mais esse evento. Com o *pattern match* depois dela, a janela dele nunca chegava a 3 eventos. Por isso ele vem antes.
+- **"Clone" não funcionou com triggers de problema único** (o padrão, e o caso de todos os triggers do template OTel). Nos testes, *clone first/last event* só gerou a cópia quando o trigger do evento de origem já estava em OK. Com o problema ainda aberto, o padrão era reconhecido (a janela fechava), mas a cópia não aparecia, sem erro na regra nem no log do server. Por isso a regra do lab renomeia e escala o primeiro evento em vez de clonar.
 - **Causa e sintoma é por ordem de chegada**, não por dependência. Por isso o `estoque` (a dependência) coleta a cada 30 s e o `pedidos` a cada 2 min: assim a falha do estoque é detectada antes do reflexo dela no pedidos. Com a mesma frequência, o `pedidos` às vezes chega primeiro e vira a "causa".
+- **A notificação sai antes do *pattern match* agir.** O PROBLEM da causa chega com o nome e a severidade originais. O "Incidente" e a severidade nova só aparecem na tela e no RESOLVED.
 - **Sintomas não notificam enquanto são sintomas.** No `caos erro`, 4 problemas geraram 1 notificação, a da causa. Quando cada sintoma se resolve, chegam o PROBLEM e o RESOLVED dele juntos.
 - A janela de causa/sintoma continua aberta depois que a causa se resolve. Qualquer evento que chegar dentro dos 10 min ainda vira sintoma.
 - O `{EVENT.CAUSE.ID}` só é resolvido em sintomas. Em eventos causa, a macro chega como `*UNKNOWN*`.
