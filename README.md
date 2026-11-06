@@ -6,7 +6,7 @@ Este lab sobe em um único `docker compose up` para revisar as novidades do **Za
 - **APM / OpenTelemetry:** o proxy recebe traces, métricas e logs via OTLP gRPC e grava tudo no ClickHouse.
 - **Alertas de APM:** cada serviço vira um host com triggers de taxa de erro, latência, logs de erro e "parou de mandar telemetria".
 - **CEP (Event processing):** regras que enriquecem eventos, agrupam causa e sintomas e detectam padrões.
-- **Cenários de falha sob comando** (`./lab.sh`): erro, lentidão, serviço fora do ar e CPU a 100%.
+- **Cenários de falha sob comando** (`./lab.sh`): erro, lentidão, serviço fora do ar e agente Linux fora.
 - **Notificações:** os alertas chegam por webhook numa página do próprio lab.
 - **Bootstrap automático:** tudo é configurado pela API na primeira subida, sem nenhum passo manual.
 
@@ -79,7 +79,7 @@ No estado normal **nenhum alerta fica aberto**. Os serviços têm só um ruído 
 ./lab.sh caos erro       # ~50% das reservas do estoque falham (HTTP 500, exceção no span, log ERROR)
 ./lab.sh caos lento      # consultas do estoque levam ~3 s (o pedidos fica lento junto)
 ./lab.sh estoque-fora    # derruba o container do estoque (o pedidos passa a responder 503)
-./lab.sh stress-linux    # CPU a 100% no linux-demo por 7 min
+./lab.sh linux-fora      # derruba o agente do linux-demo
 ./lab.sh normal          # desfaz tudo
 ./lab.sh status          # estado atual + links
 ```
@@ -88,10 +88,16 @@ Acompanhe em **Monitoring → Problems**, **APM → Traces** e na página de not
 
 | Cenário | O que deve aparecer | Tempo aproximado |
 |---|---|---|
-| `caos erro` | Logs ERROR e taxa de erro de spans acima de 5% no `estoque` (causa) e no `pedidos` (sintomas). Depois, o evento **Incidente: degradação nos serviços APM**. | 1–3 min |
+| `caos erro` | Logs ERROR e taxa de erro de spans acima de 5% no `estoque` (causa) e no `pedidos` (sintomas) | 1–3 min |
 | `caos lento` | Duração de span alta nos dois serviços | 3–5 min |
 | `estoque-fora` | **estoque parou de enviar spans** (High) + erros 503 no `pedidos` | 1–3 min |
-| `stress-linux` | *Linux: High CPU utilization* no `linux-demo` (o trigger usa média de 5 min) | 5–6 min |
+| `linux-fora` | *Linux: Zabbix agent is not available* no `linux-demo` | ~3 min |
+
+Nenhum cenário consome CPU: as falhas são simuladas no código ou com o container parado. Não há cenário de CPU alta porque os containers enxergam a CPU da VM inteira do Docker: para disparar o alerta seria preciso ocupar todos os núcleos da máquina. Os containers de demo também têm limite de 0,5 CPU e 256 MB cada.
+
+> A janela de causa/sintoma é de 10 min. Se você rodar um cenário logo depois do outro, os problemas do segundo viram sintomas da causa do primeiro. Para ver cada cenário isolado, espere uns 10 min entre eles.
+>
+> **Em investigação:** a regra de *pattern match* (incidente com 3 ou mais alertas) criou o evento **Incidente: degradação nos serviços APM** numa rodada de teste, mas não nas seguintes.
 
 ## Alertas
 
@@ -163,7 +169,8 @@ Para ter alertas dela, crie um host monitorado pelo `zabbix-proxy` com o templat
 4. **A configuração do ClickHouse mudou.** Agora existe `HistoryProvider=clickhouse;...` e `TelemetryProvider=clickhouse;...`. O `HistoryStorageURL` ficou *deprecated*. Nas imagens Docker as variáveis são `ZBX_HISTORYPROVIDER_0` e `ZBX_TELEMETRYPROVIDER_0`, cada uma com um objeto JSON. A forma `ZBX_HISTORYPROVIDERS` dá erro. Com `ZBX_*_0_SCHEMA='{"create":true}'` o entrypoint cria as tabelas.
 5. **API:** `hostinterface.update` foi removido. As interfaces agora são alteradas via `host.update`. Na API `ceprule.create`, o `formulaid` das condições só é aceito com `evaltype` 3 (expressão customizada).
 6. **`DebugLevel=4` no proxy 8.0.0 causa segfault** (signal 11) na subida.
-7. **OpenTelemetry JS 3.x (não é do Zabbix):** a API de logs saiu do `@opentelemetry/api-logs` e foi para o `@opentelemetry/api`. Com o pacote antigo, os logs simplesmente não são enviados.
+7. **Triggers de ausência em cima do template OTel:** os itens de contagem de spans e logs usam *Discard unchanged with heartbeat 1h*. Com o serviço fora, só o primeiro 0 é gravado, então expressões como `max(...,#2)=0` nunca se cumprem. Use `last()`.
+8. **OpenTelemetry JS 3.x (não é do Zabbix):** a API de logs saiu do `@opentelemetry/api-logs` e foi para o `@opentelemetry/api`. Com o pacote antigo, os logs simplesmente não são enviados.
 
 ## Comandos úteis
 
